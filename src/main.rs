@@ -103,20 +103,19 @@ impl BashLens {
             (Page::About, "i", "About BashLens"),
         ] {
             let selected = self.page == page;
-            let button = egui::Button::new(
-                RichText::new(format!("{icon}    {title}"))
-                    .size(13.0)
-                    .color(if selected { INK } else { MUTED })
-                    ,
-            )
-            .fill(if selected {
-                Color32::from_rgb(239, 239, 236)
-            } else {
-                Color32::TRANSPARENT
-            })
-            .stroke(Stroke::NONE)
-            .corner_radius(7.0)
-            .min_size(Vec2::new(ui.available_width(), 38.0));
+            let label = RichText::new(format!("{icon}    {title}"))
+                .size(13.0)
+                .color(if selected { INK } else { MUTED });
+            let label = if selected { label.strong() } else { label };
+            let button = egui::Button::new(label)
+                .fill(if selected {
+                    Color32::from_rgb(239, 239, 236)
+                } else {
+                    Color32::TRANSPARENT
+                })
+                .stroke(Stroke::NONE)
+                .corner_radius(7.0)
+                .min_size(Vec2::new(ui.available_width(), 38.0));
             if ui.add(button).clicked() {
                 self.page = page;
             }
@@ -440,9 +439,7 @@ fn analyze(text: &str) -> Analysis {
         if !actions.iter().any(|a: &Action| a.title == title) {
             actions.push(Action {
                 title,
-detail: { let evidence = matched_evidence(title, &s); if evidence.is_empty() { detail } else { format!("{detail}
-
-Matched text: {evidence}") } },
+                detail: format!("{detail}\n\nMatched text: {}", matched_evidence(title, &s)),
                 level,
             });
         }
@@ -621,10 +618,62 @@ Matched text: {evidence}") } },
     if contains_any(&s, &["&&", "||", ";", "|", "\n"]) {
         add("Chains multiple steps", "More than one command may run in sequence or pass data between programs. Read each part before continuing.".into(), Level::Review);
     }
-    if s.contains("$(") || s.contains('`') { add("Runs a nested command and inserts its output", "Shell command substitution runs an inner command first, then inserts its output into the surrounding command. Inspect the nested command and how its output is used.".into(), Level::Review); } if s.contains("$((") { add("Evaluates shell arithmetic", "The shell evaluates an arithmetic expression here. Values inside it can come from nested substitutions, so inspect the full expression.".into(), Level::Review); } if s.contains("/dev/urandom") && contains_any(&s, &["od ", "od	"]) && s.contains("%02x") { add("Converts random bytes into hexadecimal", "This text reads bytes from the operating system random source, formats them as hex, and uses the result in a larger expression. The purpose depends on the rest of the command.".into(), Level::Review); } if contains_any(&s, &["eval ", "eval	", "invoke-expression", "iex "]) && (s.contains("$(") || s.contains('`') || s.contains("base64")) { add("Evaluates generated or transformed text", "An expression runner appears alongside generated or encoded text. The resulting command may not be clear from the visible text alone.".into(), Level::High); } drop(add);    if actions.is_empty() {
-        actions.push(Action { title: "No listed pattern found", detail: "The local checks did not recognize one of their listed patterns. That is not evidence that the command is safe.".into(), level: Level::Unknown });
+    if s.contains("$(") || s.contains('`') {
+        add(
+            "Runs a nested command and inserts its output",
+            "Shell command substitution runs an inner command first, then inserts its output into the surrounding command. Inspect the nested command and how its output is used.".into(),
+            Level::Review,
+        );
     }
-    let shell = if s.contains("powershell") || s.contains("invoke-") || s.contains("winget") {
+    if s.contains("$((") {
+        add(
+            "Evaluates shell arithmetic",
+            "The shell evaluates an arithmetic expression here. Values inside it can come from nested substitutions, so inspect the full expression.".into(),
+            Level::Review,
+        );
+    }
+    if s.contains("/dev/urandom")
+        && contains_any(&s, &["od ", "od\t"])
+        && contains_any(&s, &["%02x", "%2x", "%x"])
+    {
+        add(
+            "Converts random bytes into hexadecimal",
+            "This text reads bytes from the operating system random source, formats them as hex, and uses the result in a larger expression. That describes the visible steps; the purpose depends on the rest of the command.".into(),
+            Level::Review,
+        );
+    }
+    if contains_any(&s, &["eval ", "eval\t", "invoke-expression", "iex "])
+        && (s.contains("$(") || s.contains('`') || s.contains("base64"))
+    {
+        add(
+            "Evaluates generated or transformed text",
+            "An expression runner appears alongside generated or encoded text. The resulting command may not be clear from the visible text alone.".into(),
+            Level::High,
+        );
+    }
+    if contains_command(&s, "caffeinate") {
+        add(
+            "Keeps this Mac awake temporarily",
+            caffeinate_explanation(&s),
+            Level::Review,
+        );
+    }
+    drop(add);
+    if actions.is_empty() {
+        let first_word = s
+            .split_whitespace()
+            .next()
+            .unwrap_or("(empty command)")
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+        actions.push(Action {
+            title: "Command not recognized yet",
+            detail: format!("BashLens does not have an explanation for `{first_word}` yet. It cannot tell what this program will do from its name alone. Check the program's trusted help or documentation before running it."),
+            level: Level::Unknown,
+        });
+    }
+    let shell = if s.contains("caffeinate") {
+        "Likely macOS command"
+    } else if s.contains("powershell") || s.contains("invoke-") || s.contains("winget") {
         "Likely PowerShell"
     } else if s.contains("cmd /c") || s.contains("reg add") {
         "Shell unclear"
@@ -649,26 +698,161 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
+fn contains_command(text: &str, command: &str) -> bool {
+    text.split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&'))
+        .any(|word| {
+            word.trim_matches(|c: char| {
+                !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.' && c != '/'
+            })
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name == command)
+        })
+}
+
+fn caffeinate_explanation(text: &str) -> String {
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    if let Some(index) = words.iter().position(|word| *word == "-t") {
+        if let Some(seconds) = words
+            .get(index + 1)
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            let duration = if seconds % 3600 == 0 {
+                let hours = seconds / 3600;
+                format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
+            } else if seconds % 60 == 0 {
+                let minutes = seconds / 60;
+                format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+            } else {
+                format!("{seconds} second{}", if seconds == 1 { "" } else { "s" })
+            };
+            return format!(
+                "`caffeinate` asks macOS to keep the system from going to sleep. The `-t {seconds}` option sets a {seconds}-second limit ({duration}), then the request ends. This can use more battery while it runs; it does not change or delete files."
+            );
+        }
+    }
+    "`caffeinate` asks macOS to prevent sleep while its request is active. The options control which sleep behavior is affected and how long the request lasts. This can use more battery; it does not change or delete files.".into()
+}
 
 fn matched_evidence(title: &str, text: &str) -> String {
     let needles: &[&str] = match title {
-        "Downloads or requests online content" => &["curl", "wget", "invoke-webrequest", "iwr", "irm", "bitsadmin"],
-        "Runs content from a web request" => &["curl", "wget", "webrequest", "irm", "iwr", "| sh", "| bash", "|bash", "invoke-expression"],
-        "May remove or overwrite files" => &["rm", "rmdir", "remove-item", "del", "erase", "format", "shred"],
-        "Changes file permissions or ownership" => &["chmod", "chown", "set-acl", "icacls", "takeown"],
-        "Requests elevated privileges" => &["sudo", " su ", "runas", "-verb runas"],
-        "Installs or removes software" => &["apt install", "apt-get install", "dnf install", "yum install", "pacman -s", "brew install", "winget install", "choco install", "pip install", "npm install", "cargo install", "apt remove", "brew uninstall", "winget uninstall"],
-        "Touches startup or configuration" => &["/etc/hosts", ".bashrc", ".zshrc", "profile", "startup", "launchagents", "systemd", "crontab"],
-        "May change security or system settings" => &["iptables", "ufw", "firewall", "set-mppreference", "disable-realtimemonitoring", "reg add", "security set", "spctl", "csrutil"],
-        "Contacts an online service or remote host" => &["http://", "https://", "ssh", "scp", "rsync", "nc", "netcat", "ftp"],
-        "Contains encoded or transformed text" => &["-enc", "-encodedcommand", "base64", "frombase64string", "certutil -decode", "xxd -r"],
-        "Launches another program or script" => &["bash", "sh", "zsh", "powershell", "cmd /c", "python", "node", "wscript", "cscript", "source"],
+        "Downloads or requests online content" => &[
+            "curl",
+            "wget",
+            "invoke-webrequest",
+            "iwr",
+            "irm",
+            "bitsadmin",
+            "start-bitstransfer",
+        ],
+        "Runs content from a web request" => &[
+            "curl",
+            "wget",
+            "webrequest",
+            "irm",
+            "iwr",
+            "| sh",
+            "|bash",
+            "| bash",
+            "invoke-expression",
+            "iex",
+        ],
+        "May remove or overwrite files" => &[
+            "rm",
+            "rmdir",
+            "remove-item",
+            "del",
+            "erase",
+            "format",
+            "shred",
+        ],
+        "Changes file permissions or ownership" => {
+            &["chmod", "chown", "set-acl", "icacls", "takeown"]
+        }
+        "Requests elevated privileges" => &[
+            "sudo",
+            " su ",
+            "runas",
+            "start-process -verb runas",
+            "-verb runas",
+        ],
+        "Installs or removes software" => &[
+            "apt install",
+            "apt-get install",
+            "dnf install",
+            "yum install",
+            "pacman -s",
+            "brew install",
+            "winget install",
+            "choco install",
+            "pip install",
+            "npm install",
+            "cargo install",
+            "apt remove",
+            "brew uninstall",
+            "winget uninstall",
+        ],
+        "Touches startup or configuration" => &[
+            "/etc/hosts",
+            ".bashrc",
+            ".zshrc",
+            "profile",
+            "startup",
+            "currentversion\\run",
+            "launchagents",
+            "systemd",
+            "crontab",
+        ],
+        "May change security or system settings" => &[
+            "iptables",
+            "ufw",
+            "firewall",
+            "set-mppreference",
+            "disable-realtimemonitoring",
+            "reg add",
+            "security set",
+            "spctl",
+            "csrutil",
+        ],
+        "Contacts an online service or remote host" => &[
+            "http://", "https://", "ssh", "scp", "rsync", "nc", "netcat", "ftp",
+        ],
+        "Contains encoded or transformed text" => &[
+            "-enc",
+            "-encodedcommand",
+            "base64",
+            "frombase64string",
+            "certutil -decode",
+            "xxd -r",
+        ],
+        "Launches another program or script" => &[
+            "bash",
+            "sh",
+            "zsh",
+            "powershell",
+            "cmd /c",
+            "python",
+            "node",
+            "wscript",
+            "cscript",
+            "source",
+            " ./",
+        ],
         "Chains multiple steps" => &["&&", "||", ";", "|", "\n"],
         "Runs a nested command and inserts its output" => &["$(", "`"],
         "Evaluates shell arithmetic" => &["$(("],
         "Converts random bytes into hexadecimal" => &["/dev/urandom", "od", "%02x", "tr -d", "$("],
-        "Evaluates generated or transformed text" => &["eval", "invoke-expression", "iex", "$(", "`", "base64"],
+        "Evaluates generated or transformed text" => {
+            &["eval", "invoke-expression", "iex", "$(", "`", "base64"]
+        }
+        "Keeps this Mac awake temporarily" => &["caffeinate"],
         _ => &[],
     };
-    needles.iter().filter(|needle| text.contains(**needle)).map(|needle| format!("`{needle}`")).collect::<Vec<_>>().join("  ·  ")
+
+    let matches = needles
+        .iter()
+        .filter(|needle| text.contains(**needle))
+        .map(|needle| format!("`{needle}`"))
+        .collect::<Vec<_>>();
+    matches.join("  ·  ")
 }
