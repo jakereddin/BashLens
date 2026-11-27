@@ -57,6 +57,7 @@ struct Action {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Level {
+    Info,
     Review,
     High,
     Unknown,
@@ -103,20 +104,19 @@ impl BashLens {
             (Page::About, "i", "About BashLens"),
         ] {
             let selected = self.page == page;
-            let button = egui::Button::new(
-                RichText::new(format!("{icon}    {title}"))
-                    .size(13.0)
-                    .color(if selected { INK } else { MUTED })
-                    ,
-            )
-            .fill(if selected {
-                Color32::from_rgb(239, 239, 236)
-            } else {
-                Color32::TRANSPARENT
-            })
-            .stroke(Stroke::NONE)
-            .corner_radius(7.0)
-            .min_size(Vec2::new(ui.available_width(), 38.0));
+            let label = RichText::new(format!("{icon}    {title}"))
+                .size(13.0)
+                .color(if selected { INK } else { MUTED });
+            let label = if selected { label.strong() } else { label };
+            let button = egui::Button::new(label)
+                .fill(if selected {
+                    Color32::from_rgb(239, 239, 236)
+                } else {
+                    Color32::TRANSPARENT
+                })
+                .stroke(Stroke::NONE)
+                .corner_radius(7.0)
+                .min_size(Vec2::new(ui.available_width(), 38.0));
             if ui.add(button).clicked() {
                 self.page = page;
             }
@@ -287,6 +287,7 @@ impl BashLens {
 
     fn notice_panel(&self, ui: &mut egui::Ui, title: &str, detail: &str, level: Level) {
         let tag = match level {
+            Level::Info => "BREAKDOWN",
             Level::Review => "REVIEW",
             Level::High => "HIGH IMPACT",
             Level::Unknown => "LIMIT",
@@ -438,15 +439,23 @@ fn analyze(text: &str) -> Analysis {
     let mut actions = Vec::new();
     let mut add = |title: &'static str, detail: String, level: Level| {
         if !actions.iter().any(|a: &Action| a.title == title) {
+            let evidence = matched_evidence(title, &s);
             actions.push(Action {
                 title,
-detail: { let evidence = matched_evidence(title, &s); if evidence.is_empty() { detail } else { format!("{detail}
-
-Matched text: {evidence}") } },
+                detail: if evidence.is_empty() {
+                    detail
+                } else {
+                    format!("{detail}\n\nMatched text: {evidence}")
+                },
                 level,
             });
         }
     };
+    add(
+        "Command breakdown",
+        explain_command_structure(text),
+        Level::Info,
+    );
     if contains_any(
         &s,
         &[
@@ -637,11 +646,11 @@ Matched text: {evidence}") } },
     }
     if s.contains("/dev/urandom")
         && contains_any(&s, &["od ", "od\t"])
-        && s.contains("%02x")
+        && contains_any(&s, &["%02x", "%2x", "%x"])
     {
         add(
             "Converts random bytes into hexadecimal",
-            "This text reads bytes from the operating system random source, formats them as hex, and uses the result in a larger expression. The purpose depends on the rest of the command.".into(),
+            "This text reads bytes from the operating system random source, formats them as hex, and uses the result in a larger expression. That describes the visible steps; the purpose depends on the rest of the command.".into(),
             Level::Review,
         );
     }
@@ -701,6 +710,349 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
+fn explain_command_structure(text: &str) -> String {
+    let chunks = split_shell_commands(text);
+    let mut notes = Vec::new();
+    let mut shown = 0usize;
+
+    for (command, connector) in &chunks {
+        let words = shell_words(command);
+        if words.is_empty() {
+            continue;
+        }
+        shown += 1;
+        if shown > 8 {
+            notes.push(
+                "Further command parts are omitted here; the full text remains above.".into(),
+            );
+            break;
+        }
+
+        let executable_index = words
+            .iter()
+            .position(|word| !is_environment_assignment(word))
+            .unwrap_or(0);
+        let executable =
+            words[executable_index].trim_matches(|c: char| c == '\'' || c == '"' || c == '`');
+        let program = executable
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(executable)
+            .strip_suffix(".exe")
+            .unwrap_or_else(|| executable.rsplit(['/', '\\']).next().unwrap_or(executable));
+        let args = words
+            .iter()
+            .skip(executable_index + 1)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut line = format!("{}. Program: `{program}`", shown);
+        if let Some(summary) = command_summary(&program.to_ascii_lowercase()) {
+            line.push_str(&format!(" — {summary}"));
+        } else {
+            line.push_str(" — no built-in description for this program; its internal behavior is unknown to BashLens.");
+        }
+        if args.is_empty() {
+            line.push_str("\n   Arguments: none shown.");
+        } else {
+            let preview = args
+                .iter()
+                .take(10)
+                .map(|arg| format!("`{arg}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let remaining = args.len().saturating_sub(10);
+            line.push_str(&format!("\n   Arguments: {preview}"));
+            if remaining > 0 {
+                line.push_str(&format!(" and {remaining} more"));
+            }
+        }
+        if is_environment_assignment(&words[0]) {
+            let assignments = words[..executable_index].join(" ");
+            line.push_str(&format!("\n   Sets command environment: `{assignments}`."));
+        }
+        if let Some(connector) = connector {
+            if !connector.is_empty() {
+                line.push_str(&format!("\n   {}", explain_connector(connector)));
+            }
+        }
+        notes.push(line);
+    }
+
+    if notes.is_empty() {
+        return "No executable command was found in the pasted text. It may contain only shell syntax, a comment, or an incomplete command.".into();
+    }
+    if text.contains("$(") || text.contains('`') {
+        notes.push("Shell expansion detected: an inner command may run and its output may be inserted into another part.".into());
+    }
+    if text.contains("$((") {
+        notes.push("Arithmetic expansion detected: the shell calculates a value from the expression inside `$((...))`.".into());
+    }
+    notes.join("\n\n")
+}
+
+fn split_shell_commands(text: &str) -> Vec<(String, Option<String>)> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            current.push(ch);
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            current.push(ch);
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            current.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '(' {
+            paren_depth += 1;
+            current.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == ')' && paren_depth > 0 {
+            paren_depth -= 1;
+            current.push(ch);
+            index += 1;
+            continue;
+        }
+        if paren_depth == 0 {
+            let operator =
+                if ch == '&' && (current.ends_with('>') || chars.get(index + 1) == Some(&'>')) {
+                    None
+                } else if ch == '|' && chars.get(index + 1) == Some(&'|') {
+                    Some(("||", 2))
+                } else if ch == '&' && chars.get(index + 1) == Some(&'&') {
+                    Some(("&&", 2))
+                } else if ch == '|' && chars.get(index + 1) == Some(&'&') {
+                    Some(("|&", 2))
+                } else if matches!(ch, '|' | ';' | '&' | '\n' | '\r') {
+                    Some((
+                        match ch {
+                            '|' => "|",
+                            ';' => ";",
+                            '&' => "&",
+                            '\n' | '\r' => "\n",
+                            _ => "",
+                        },
+                        1,
+                    ))
+                } else {
+                    None
+                };
+            if let Some((operator, width)) = operator {
+                result.push((current.trim().to_string(), Some(operator.to_string())));
+                current.clear();
+                index += width;
+                if operator == "\n" && ch == '\r' && chars.get(index) == Some(&'\n') {
+                    index += 1;
+                }
+                continue;
+            }
+        }
+        current.push(ch);
+        index += 1;
+    }
+    if !current.trim().is_empty() {
+        result.push((current.trim().to_string(), None));
+    }
+    result
+}
+
+fn shell_words(command: &str) -> Vec<String> {
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            current.push(ch);
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            current.push(ch);
+            if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            current.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '(' {
+            paren_depth += 1;
+            current.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == ')' && paren_depth > 0 {
+            paren_depth -= 1;
+            current.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch.is_whitespace() && paren_depth == 0 {
+            push_word(&mut words, &mut current);
+            index += 1;
+            continue;
+        }
+        if matches!(ch, '<' | '>') && paren_depth == 0 {
+            push_word(&mut words, &mut current);
+            let mut operator = ch.to_string();
+            if chars.get(index + 1) == Some(&ch) {
+                operator.push(ch);
+                index += 1;
+            }
+            if chars.get(index + 1) == Some(&'&') {
+                operator.push('&');
+                index += 1;
+            }
+            words.push(operator);
+            index += 1;
+            continue;
+        }
+        current.push(ch);
+        index += 1;
+    }
+    push_word(&mut words, &mut current);
+    words
+}
+
+fn push_word(words: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        words.push(std::mem::take(current));
+    }
+}
+
+fn is_environment_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && name.chars().next().is_some_and(|ch| !ch.is_ascii_digit())
+}
+
+fn explain_connector(connector: &str) -> String {
+    match connector {
+        "|" | "|&" => "Passes output to the next command through a pipe.".into(),
+        "&&" => "Runs the next command only if this command succeeds.".into(),
+        "||" => "Runs the next command only if this command fails.".into(),
+        ";" | "\n" => "Runs the next command afterward.".into(),
+        "&" => "Uses `&`; this can start a background command in POSIX shells or act as a call operator in PowerShell.".into(),
+        _ => format!("Next operator: `{connector}`."),
+    }
+}
+
+fn command_summary(program: &str) -> Option<&'static str> {
+    Some(match program.trim_matches(['\'', '"', '`']) {
+        "bash" | "sh" | "zsh" | "pwsh" | "powershell" | "cmd" => {
+            "starts a shell that can interpret additional commands or scripts"
+        }
+        "caffeinate" => "asks macOS to prevent idle sleep by default",
+        "cd" => "changes the current shell's working folder",
+        "pwd" => "prints the current folder path",
+        "ls" | "dir" | "get-childitem" | "gci" => "lists files and folders",
+        "cat" | "type" | "get-content" => "prints file contents",
+        "echo" | "printf" | "write-output" => "prints text or formatted output",
+        "cp" | "copy" | "copy-item" => "copies files or folders",
+        "mv" | "move" | "move-item" | "ren" | "rename-item" => "moves or renames files",
+        "rm" | "del" | "erase" | "remove-item" => "removes files or folders",
+        "mkdir" | "md" | "new-item" => "creates a folder or filesystem item",
+        "rmdir" => "removes a folder",
+        "touch" => "creates a file or updates its modification time",
+        "find" | "where-object" | "where" => {
+            "searches files or filters input, depending on the shell"
+        }
+        "grep" | "rg" | "select-string" => "searches text for a matching pattern",
+        "head" => "prints the start of input",
+        "tail" => "prints the end of input",
+        "sort" => "orders lines of input",
+        "uniq" => "filters repeated adjacent lines",
+        "wc" => "counts lines, words, or bytes",
+        "cut" => "selects fields or character ranges from input",
+        "tr" => "translates or removes characters from input",
+        "od" | "xxd" => "displays input bytes in a chosen representation",
+        "sed" => "edits or filters text streams according to expressions",
+        "awk" => "processes text using field and pattern rules",
+        "xargs" => "builds command arguments from input and starts another program",
+        "sleep" => "waits for a specified time",
+        "date" => "prints or formats the date and time",
+        "whoami" => "prints the current account name",
+        "uname" => "prints operating system information",
+        "ps" | "tasklist" | "get-process" => "lists running processes",
+        "kill" | "stop-process" => "sends a stop signal to a process",
+        "chmod" | "icacls" => "changes file access permissions",
+        "chown" | "takeown" => "changes file ownership",
+        "sudo" | "runas" | "start-process" => {
+            "may start a program with elevated permissions, depending on options"
+        }
+        "curl" | "wget" | "invoke-webrequest" | "iwr" => {
+            "makes a network request or downloads content"
+        }
+        "ssh" | "scp" | "rsync" => "connects to another computer or transfers files",
+        "ping" => "sends network reachability requests to a host",
+        "git" => "runs a source-control operation; the subcommand determines the change",
+        "npm" | "cargo" | "brew" | "apt" | "apt-get" | "dnf" | "yum" | "winget" | "choco" => {
+            "runs a software package or project tool; the subcommand determines the change"
+        }
+        "python" | "python3" | "node" | "ruby" | "perl" => {
+            "runs a programming-language interpreter; inspect the script or expression arguments"
+        }
+        "open" | "start" | "explorer" => "opens a file, folder, or application",
+        "env" => "sets or displays environment variables before starting a program",
+        "export" | "set" => "sets shell or process variables, depending on the shell",
+        "source" | "." => "loads a script into the current shell session",
+        "eval" => "asks the shell to interpret generated text as another command",
+        "reg" => "reads or changes Windows registry data, depending on arguments",
+        "ipconfig" | "ifconfig" | "ip" => {
+            "displays or changes network interface settings, depending on arguments"
+        }
+        _ => return None,
+    })
+}
+
 fn contains_command(text: &str, command: &str) -> bool {
     text.split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&'))
         .any(|word| {
@@ -716,7 +1068,10 @@ fn contains_command(text: &str, command: &str) -> bool {
 fn caffeinate_explanation(text: &str) -> String {
     let words = text.split_whitespace().collect::<Vec<_>>();
     if let Some(index) = words.iter().position(|word| *word == "-t") {
-        if let Some(seconds) = words.get(index + 1).and_then(|value| value.parse::<u64>().ok()) {
+        if let Some(seconds) = words
+            .get(index + 1)
+            .and_then(|value| value.parse::<u64>().ok())
+        {
             let duration = if seconds % 3600 == 0 {
                 let hours = seconds / 3600;
                 format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
@@ -734,27 +1089,125 @@ fn caffeinate_explanation(text: &str) -> String {
     "`caffeinate` asks macOS to prevent sleep while its request is active. The options control which sleep behavior is affected and how long the request lasts. This can use more battery; it does not change or delete files.".into()
 }
 
-
 fn matched_evidence(title: &str, text: &str) -> String {
     let needles: &[&str] = match title {
-        "Downloads or requests online content" => &["curl", "wget", "invoke-webrequest", "iwr", "irm", "bitsadmin"],
-        "Runs content from a web request" => &["curl", "wget", "webrequest", "irm", "iwr", "| sh", "| bash", "|bash", "invoke-expression"],
-        "May remove or overwrite files" => &["rm", "rmdir", "remove-item", "del", "erase", "format", "shred"],
-        "Changes file permissions or ownership" => &["chmod", "chown", "set-acl", "icacls", "takeown"],
-        "Requests elevated privileges" => &["sudo", " su ", "runas", "-verb runas"],
-        "Installs or removes software" => &["apt install", "apt-get install", "dnf install", "yum install", "pacman -s", "brew install", "winget install", "choco install", "pip install", "npm install", "cargo install", "apt remove", "brew uninstall", "winget uninstall"],
-        "Touches startup or configuration" => &["/etc/hosts", ".bashrc", ".zshrc", "profile", "startup", "launchagents", "systemd", "crontab"],
-        "May change security or system settings" => &["iptables", "ufw", "firewall", "set-mppreference", "disable-realtimemonitoring", "reg add", "security set", "spctl", "csrutil"],
-        "Contacts an online service or remote host" => &["http://", "https://", "ssh", "scp", "rsync", "nc", "netcat", "ftp"],
-        "Contains encoded or transformed text" => &["-enc", "-encodedcommand", "base64", "frombase64string", "certutil -decode", "xxd -r"],
-        "Launches another program or script" => &["bash", "sh", "zsh", "powershell", "cmd /c", "python", "node", "wscript", "cscript", "source"],
+        "Downloads or requests online content" => &[
+            "curl",
+            "wget",
+            "invoke-webrequest",
+            "iwr",
+            "irm",
+            "bitsadmin",
+            "start-bitstransfer",
+        ],
+        "Runs content from a web request" => &[
+            "curl",
+            "wget",
+            "webrequest",
+            "irm",
+            "iwr",
+            "| sh",
+            "|bash",
+            "| bash",
+            "invoke-expression",
+            "iex",
+        ],
+        "May remove or overwrite files" => &[
+            "rm",
+            "rmdir",
+            "remove-item",
+            "del",
+            "erase",
+            "format",
+            "shred",
+        ],
+        "Changes file permissions or ownership" => {
+            &["chmod", "chown", "set-acl", "icacls", "takeown"]
+        }
+        "Requests elevated privileges" => &[
+            "sudo",
+            " su ",
+            "runas",
+            "start-process -verb runas",
+            "-verb runas",
+        ],
+        "Installs or removes software" => &[
+            "apt install",
+            "apt-get install",
+            "dnf install",
+            "yum install",
+            "pacman -s",
+            "brew install",
+            "winget install",
+            "choco install",
+            "pip install",
+            "npm install",
+            "cargo install",
+            "apt remove",
+            "brew uninstall",
+            "winget uninstall",
+        ],
+        "Touches startup or configuration" => &[
+            "/etc/hosts",
+            ".bashrc",
+            ".zshrc",
+            "profile",
+            "startup",
+            "currentversion\\run",
+            "launchagents",
+            "systemd",
+            "crontab",
+        ],
+        "May change security or system settings" => &[
+            "iptables",
+            "ufw",
+            "firewall",
+            "set-mppreference",
+            "disable-realtimemonitoring",
+            "reg add",
+            "security set",
+            "spctl",
+            "csrutil",
+        ],
+        "Contacts an online service or remote host" => &[
+            "http://", "https://", "ssh", "scp", "rsync", "nc", "netcat", "ftp",
+        ],
+        "Contains encoded or transformed text" => &[
+            "-enc",
+            "-encodedcommand",
+            "base64",
+            "frombase64string",
+            "certutil -decode",
+            "xxd -r",
+        ],
+        "Launches another program or script" => &[
+            "bash",
+            "sh",
+            "zsh",
+            "powershell",
+            "cmd /c",
+            "python",
+            "node",
+            "wscript",
+            "cscript",
+            "source",
+            " ./",
+        ],
         "Chains multiple steps" => &["&&", "||", ";", "|", "\n"],
         "Runs a nested command and inserts its output" => &["$(", "`"],
         "Evaluates shell arithmetic" => &["$(("],
         "Converts random bytes into hexadecimal" => &["/dev/urandom", "od", "%02x", "tr -d", "$("],
-        "Evaluates generated or transformed text" => &["eval", "invoke-expression", "iex", "$(", "`", "base64"],
+        "Evaluates generated or transformed text" => {
+            &["eval", "invoke-expression", "iex", "$(", "`", "base64"]
+        }
         "Keeps this Mac awake temporarily" => &["caffeinate"],
         _ => &[],
     };
-    needles.iter().filter(|needle| text.contains(**needle)).map(|needle| format!("`{needle}`")).collect::<Vec<_>>().join("  ·  ")
+
+    let matches = needles
+        .iter()
+        .filter(|needle| text.contains(**needle))
+        .map(|needle| format!("`{needle}`"))
+        .collect::<Vec<_>>();
+    matches.join("  ·  ")
 }
