@@ -1,4 +1,8 @@
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
+use flate2::read::GzDecoder;
+use std::fs;
+use std::io::Read;
+use std::path::PathBuf;
 
 const INK: Color32 = Color32::from_rgb(25, 26, 28);
 const MUTED: Color32 = Color32::from_rgb(111, 113, 117);
@@ -746,7 +750,11 @@ fn explain_command_structure(text: &str) -> String {
             .cloned()
             .collect::<Vec<_>>();
         let mut line = format!("{}. Program: `{program}`", shown);
-        if let Some(summary) = command_summary(&program.to_ascii_lowercase()) {
+        let normalized_program = program.to_ascii_lowercase();
+        let summary = command_summary(&normalized_program)
+            .map(str::to_owned)
+            .or_else(|| local_manual_summary(program));
+        if let Some(summary) = summary {
             line.push_str(&format!(" — {summary}"));
         } else {
             line.push_str(" — no built-in description for this program; its internal behavior is unknown to BashLens.");
@@ -770,6 +778,15 @@ fn explain_command_structure(text: &str) -> String {
             let assignments = words[..executable_index].join(" ");
             line.push_str(&format!("\n   Sets command environment: `{assignments}`."));
         }
+        if args.windows(2).any(|pair| {
+            pair[0] == "-"
+                && pair[1]
+                    .trim_matches(['\'', '"'])
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphabetic())
+        }) {
+            line.push_str("\n   Option spacing: `-` and the following word are separate arguments. If you meant an option, join them (for example, write `-onlyin` without a space)." );
+        }
         if let Some(connector) = connector {
             if !connector.is_empty() {
                 line.push_str(&format!("\n   {}", explain_connector(connector)));
@@ -786,6 +803,12 @@ fn explain_command_structure(text: &str) -> String {
     }
     if text.contains("$((") {
         notes.push("Arithmetic expansion detected: the shell calculates a value from the expression inside `$((...))`.".into());
+    }
+    if text.contains('$') {
+        notes.push("Dollar-prefixed variables and substitutions can be expanded using values from the current shell session; those values are not available from the pasted text alone.".into());
+    }
+    if shell_words(text).iter().any(|word| word.starts_with("~/")) {
+        notes.push("An unquoted `~/` path normally expands to the current user's home folder before the program receives it.".into());
     }
     notes.join("\n\n")
 }
@@ -1051,6 +1074,190 @@ fn command_summary(program: &str) -> Option<&'static str> {
         }
         _ => return None,
     })
+}
+
+fn local_manual_summary(command: &str) -> Option<String> {
+    let name = command
+        .rsplit(['/', '\\'])
+        .next()?
+        .trim_matches(['\'', '"', '`']);
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '+'))
+    {
+        return None;
+    }
+
+    let mut roots = vec![
+        PathBuf::from("/usr/share/man"),
+        PathBuf::from("/usr/local/share/man"),
+        PathBuf::from("/opt/homebrew/share/man"),
+        PathBuf::from("/opt/local/share/man"),
+        PathBuf::from("/usr/X11R6/man"),
+    ];
+    if let Some(manpath) = std::env::var_os("MANPATH") {
+        roots.extend(std::env::split_paths(&manpath));
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home = PathBuf::from(home);
+        roots.push(home.join(".local/share/man"));
+        roots.push(home.join("share/man"));
+    }
+
+    for root in roots {
+        for section in ["1", "6", "8"] {
+            for extension in ["", ".gz"] {
+                let path = root
+                    .join(format!("man{section}"))
+                    .join(format!("{name}.{section}{extension}"));
+                let bytes = match fs::read(&path) {
+                    Ok(bytes) if bytes.len() <= 1_000_000 => bytes,
+                    _ => continue,
+                };
+                let contents = if extension == ".gz" {
+                    let mut decoded = String::new();
+                    if GzDecoder::new(bytes.as_slice())
+                        .take(256_000)
+                        .read_to_string(&mut decoded)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    decoded
+                } else {
+                    String::from_utf8_lossy(&bytes).into_owned()
+                };
+                if let Some(summary) = extract_manual_summary(&contents) {
+                    return Some(summary);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_manual_summary(manual: &str) -> Option<String> {
+    let mut section = "";
+    let mut name_summary = String::new();
+    let mut description = String::new();
+    for line in manual.lines() {
+        if let Some((macro_name, title)) = roff_macro(line) {
+            if matches!(macro_name.as_str(), "SH" | "Sh" | "SS" | "Ss") {
+                let heading = title.trim().to_ascii_uppercase();
+                if heading == "NAME" {
+                    section = "NAME";
+                } else if heading == "DESCRIPTION" {
+                    section = "DESCRIPTION";
+                } else {
+                    section = "";
+                }
+                continue;
+            }
+            if section == "NAME" && macro_name == "Nd" {
+                append_text(&mut name_summary, &roff_text(title));
+                continue;
+            }
+            if section == "NAME" && macro_name == "Nm" {
+                continue;
+            }
+        }
+
+        match section {
+            "NAME" => {
+                let plain = roff_text(line);
+                if let Some((_, summary)) = plain
+                    .split_once(" – ")
+                    .or_else(|| plain.split_once(" — "))
+                    .or_else(|| plain.split_once(" - "))
+                {
+                    append_text(&mut name_summary, summary);
+                } else if !plain.is_empty() && name_summary.is_empty() {
+                    append_text(&mut name_summary, &plain);
+                }
+            }
+            "DESCRIPTION" => {
+                let plain = roff_text(line);
+                if !plain.is_empty() {
+                    append_text(&mut description, &plain);
+                }
+            }
+            _ => {}
+        }
+        if name_summary.len() > 500 || description.len() > 800 {
+            break;
+        }
+    }
+
+    let summary = if name_summary.trim().is_empty() {
+        description.trim()
+    } else {
+        name_summary.trim()
+    };
+    if summary.is_empty() {
+        return None;
+    }
+    let summary = summary
+        .split_once(". ")
+        .map(|(first, _)| format!("{first}."))
+        .unwrap_or_else(|| summary.to_string());
+    Some(summary.chars().take(300).collect())
+}
+
+fn roff_macro(line: &str) -> Option<(String, &str)> {
+    let line = line.trim_start();
+    if !line.starts_with('.') && !line.starts_with('\'') {
+        return None;
+    }
+    let body = &line[1..];
+    let split = body.find(char::is_whitespace).unwrap_or(body.len());
+    Some((body[..split].to_string(), body[split..].trim()))
+}
+
+fn roff_text(line: &str) -> String {
+    let line = line.trim();
+    if let Some((macro_name, rest)) = roff_macro(line) {
+        if matches!(macro_name.as_str(), "\\" | "TH" | "Dt" | "Dd" | "Os") {
+            return String::new();
+        }
+        if matches!(macro_name.as_str(), "SH" | "Sh" | "SS" | "Ss") {
+            return String::new();
+        }
+        if matches!(
+            macro_name.as_str(),
+            "Pp" | "PP" | "LP" | "br" | "sp" | "TP" | "RS" | "RE"
+        ) {
+            return String::new();
+        }
+        return clean_roff_escapes(rest);
+    }
+    clean_roff_escapes(line)
+}
+
+fn clean_roff_escapes(text: &str) -> String {
+    text.replace("\\fB", "")
+        .replace("\\fI", "")
+        .replace("\\fP", "")
+        .replace("\\fR", "")
+        .replace("\\-", "-")
+        .replace("\\&", "")
+        .replace("\\e", "\\")
+        .replace("\\(em", "—")
+        .replace("\\(en", "–")
+        .replace('\\', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn append_text(target: &mut String, text: &str) {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !text.is_empty() {
+        if !target.is_empty() {
+            target.push(' ');
+        }
+        target.push_str(&text);
+    }
 }
 
 fn contains_command(text: &str, command: &str) -> bool {
