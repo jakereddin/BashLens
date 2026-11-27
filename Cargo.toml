@@ -1,0 +1,15 @@
+[package]
+name = "bashlens"
+version = "0.1.0"
+edition = "2021"
+description = "A private, local command review app"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+arboard = "3.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
