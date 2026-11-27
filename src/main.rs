@@ -440,7 +440,9 @@ fn analyze(text: &str) -> Analysis {
         if !actions.iter().any(|a: &Action| a.title == title) {
             actions.push(Action {
                 title,
-                detail,
+detail: { let evidence = matched_evidence(title, &s); if evidence.is_empty() { detail } else { format!("{detail}
+
+Matched text: {evidence}") } },
                 level,
             });
         }
@@ -619,7 +621,7 @@ fn analyze(text: &str) -> Analysis {
     if contains_any(&s, &["&&", "||", ";", "|", "\n"]) {
         add("Chains multiple steps", "More than one command may run in sequence or pass data between programs. Read each part before continuing.".into(), Level::Review);
     }
-    drop(add);    if actions.is_empty() {
+    if s.contains("$(") || s.contains('`') { add("Runs a nested command and inserts its output", "Shell command substitution runs an inner command first, then inserts its output into the surrounding command. Inspect the nested command and how its output is used.".into(), Level::Review); } if s.contains("$((") { add("Evaluates shell arithmetic", "The shell evaluates an arithmetic expression here. Values inside it can come from nested substitutions, so inspect the full expression.".into(), Level::Review); } if s.contains("/dev/urandom") && contains_any(&s, &["od ", "od	"]) && s.contains("%02x") { add("Converts random bytes into hexadecimal", "This text reads bytes from the operating system random source, formats them as hex, and uses the result in a larger expression. The purpose depends on the rest of the command.".into(), Level::Review); } if contains_any(&s, &["eval ", "eval	", "invoke-expression", "iex "]) && (s.contains("$(") || s.contains('`') || s.contains("base64")) { add("Evaluates generated or transformed text", "An expression runner appears alongside generated or encoded text. The resulting command may not be clear from the visible text alone.".into(), Level::High); } drop(add);    if actions.is_empty() {
         actions.push(Action { title: "No listed pattern found", detail: "The local checks did not recognize one of their listed patterns. That is not evidence that the command is safe.".into(), level: Level::Unknown });
     }
     let shell = if s.contains("powershell") || s.contains("invoke-") || s.contains("winget") {
@@ -645,4 +647,28 @@ fn analyze(text: &str) -> Analysis {
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
+}
+
+
+fn matched_evidence(title: &str, text: &str) -> String {
+    let needles: &[&str] = match title {
+        "Downloads or requests online content" => &["curl", "wget", "invoke-webrequest", "iwr", "irm", "bitsadmin"],
+        "Runs content from a web request" => &["curl", "wget", "webrequest", "irm", "iwr", "| sh", "| bash", "|bash", "invoke-expression"],
+        "May remove or overwrite files" => &["rm", "rmdir", "remove-item", "del", "erase", "format", "shred"],
+        "Changes file permissions or ownership" => &["chmod", "chown", "set-acl", "icacls", "takeown"],
+        "Requests elevated privileges" => &["sudo", " su ", "runas", "-verb runas"],
+        "Installs or removes software" => &["apt install", "apt-get install", "dnf install", "yum install", "pacman -s", "brew install", "winget install", "choco install", "pip install", "npm install", "cargo install", "apt remove", "brew uninstall", "winget uninstall"],
+        "Touches startup or configuration" => &["/etc/hosts", ".bashrc", ".zshrc", "profile", "startup", "launchagents", "systemd", "crontab"],
+        "May change security or system settings" => &["iptables", "ufw", "firewall", "set-mppreference", "disable-realtimemonitoring", "reg add", "security set", "spctl", "csrutil"],
+        "Contacts an online service or remote host" => &["http://", "https://", "ssh", "scp", "rsync", "nc", "netcat", "ftp"],
+        "Contains encoded or transformed text" => &["-enc", "-encodedcommand", "base64", "frombase64string", "certutil -decode", "xxd -r"],
+        "Launches another program or script" => &["bash", "sh", "zsh", "powershell", "cmd /c", "python", "node", "wscript", "cscript", "source"],
+        "Chains multiple steps" => &["&&", "||", ";", "|", "\n"],
+        "Runs a nested command and inserts its output" => &["$(", "`"],
+        "Evaluates shell arithmetic" => &["$(("],
+        "Converts random bytes into hexadecimal" => &["/dev/urandom", "od", "%02x", "tr -d", "$("],
+        "Evaluates generated or transformed text" => &["eval", "invoke-expression", "iex", "$(", "`", "base64"],
+        _ => &[],
+    };
+    needles.iter().filter(|needle| text.contains(**needle)).map(|needle| format!("`{needle}`")).collect::<Vec<_>>().join("  ·  ")
 }
