@@ -621,7 +621,7 @@ Matched text: {evidence}") } },
     if contains_any(&s, &["&&", "||", ";", "|", "\n"]) {
         add("Chains multiple steps", "More than one command may run in sequence or pass data between programs. Read each part before continuing.".into(), Level::Review);
     }
-    if s.contains("$(") || s.contains('`') { add("Runs a nested command and inserts its output", "Shell command substitution runs an inner command first, then inserts its output into the surrounding command. Inspect the nested command and how its output is used.".into(), Level::Review); } if s.contains("$((") { add("Evaluates shell arithmetic", "The shell evaluates an arithmetic expression here. Values inside it can come from nested substitutions, so inspect the full expression.".into(), Level::Review); } if s.contains("/dev/urandom") && contains_any(&s, &["od ", "od	"]) && s.contains("%02x") { add("Converts random bytes into hexadecimal", "This text reads bytes from the operating system random source, formats them as hex, and uses the result in a larger expression. The purpose depends on the rest of the command.".into(), Level::Review); } if contains_any(&s, &["eval ", "eval	", "invoke-expression", "iex "]) && (s.contains("$(") || s.contains('`') || s.contains("base64")) { add("Evaluates generated or transformed text", "An expression runner appears alongside generated or encoded text. The resulting command may not be clear from the visible text alone.".into(), Level::High); } if contains_command(&s, "caffeinate") {
+    if contains_command(&s, "caffeinate") {
         add(
             "Keeps this Mac awake temporarily",
             caffeinate_explanation(&s),
