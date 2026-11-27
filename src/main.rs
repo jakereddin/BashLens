@@ -621,10 +621,29 @@ Matched text: {evidence}") } },
     if contains_any(&s, &["&&", "||", ";", "|", "\n"]) {
         add("Chains multiple steps", "More than one command may run in sequence or pass data between programs. Read each part before continuing.".into(), Level::Review);
     }
-    if s.contains("$(") || s.contains('`') { add("Runs a nested command and inserts its output", "Shell command substitution runs an inner command first, then inserts its output into the surrounding command. Inspect the nested command and how its output is used.".into(), Level::Review); } if s.contains("$((") { add("Evaluates shell arithmetic", "The shell evaluates an arithmetic expression here. Values inside it can come from nested substitutions, so inspect the full expression.".into(), Level::Review); } if s.contains("/dev/urandom") && contains_any(&s, &["od ", "od	"]) && s.contains("%02x") { add("Converts random bytes into hexadecimal", "This text reads bytes from the operating system random source, formats them as hex, and uses the result in a larger expression. The purpose depends on the rest of the command.".into(), Level::Review); } if contains_any(&s, &["eval ", "eval	", "invoke-expression", "iex "]) && (s.contains("$(") || s.contains('`') || s.contains("base64")) { add("Evaluates generated or transformed text", "An expression runner appears alongside generated or encoded text. The resulting command may not be clear from the visible text alone.".into(), Level::High); } drop(add);    if actions.is_empty() {
-        actions.push(Action { title: "No listed pattern found", detail: "The local checks did not recognize one of their listed patterns. That is not evidence that the command is safe.".into(), level: Level::Unknown });
+    if s.contains("$(") || s.contains('`') { add("Runs a nested command and inserts its output", "Shell command substitution runs an inner command first, then inserts its output into the surrounding command. Inspect the nested command and how its output is used.".into(), Level::Review); } if s.contains("$((") { add("Evaluates shell arithmetic", "The shell evaluates an arithmetic expression here. Values inside it can come from nested substitutions, so inspect the full expression.".into(), Level::Review); } if s.contains("/dev/urandom") && contains_any(&s, &["od ", "od	"]) && s.contains("%02x") { add("Converts random bytes into hexadecimal", "This text reads bytes from the operating system random source, formats them as hex, and uses the result in a larger expression. The purpose depends on the rest of the command.".into(), Level::Review); } if contains_any(&s, &["eval ", "eval	", "invoke-expression", "iex "]) && (s.contains("$(") || s.contains('`') || s.contains("base64")) { add("Evaluates generated or transformed text", "An expression runner appears alongside generated or encoded text. The resulting command may not be clear from the visible text alone.".into(), Level::High); } if contains_command(&s, "caffeinate") {
+        add(
+            "Keeps this Mac awake temporarily",
+            caffeinate_explanation(&s),
+            Level::Review,
+        );
     }
-    let shell = if s.contains("powershell") || s.contains("invoke-") || s.contains("winget") {
+    drop(add);
+    if actions.is_empty() {
+        let first_word = s
+            .split_whitespace()
+            .next()
+            .unwrap_or("(empty command)")
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+        actions.push(Action {
+            title: "Command not recognized yet",
+            detail: format!("BashLens does not have an explanation for `{first_word}` yet. It cannot tell what this program will do from its name alone. Check the program's trusted help or documentation before running it."),
+            level: Level::Unknown,
+        });
+    }
+    let shell = if s.contains("caffeinate") {
+        "Likely macOS command"
+    } else if s.contains("powershell") || s.contains("invoke-") || s.contains("winget") {
         "Likely PowerShell"
     } else if s.contains("cmd /c") || s.contains("reg add") {
         "Shell unclear"
@@ -649,6 +668,39 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
+fn contains_command(text: &str, command: &str) -> bool {
+    text.split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&'))
+        .any(|word| {
+            word.trim_matches(|c: char| {
+                !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.' && c != '/'
+            })
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name == command)
+        })
+}
+
+fn caffeinate_explanation(text: &str) -> String {
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    if let Some(index) = words.iter().position(|word| *word == "-t") {
+        if let Some(seconds) = words.get(index + 1).and_then(|value| value.parse::<u64>().ok()) {
+            let duration = if seconds % 3600 == 0 {
+                let hours = seconds / 3600;
+                format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
+            } else if seconds % 60 == 0 {
+                let minutes = seconds / 60;
+                format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+            } else {
+                format!("{seconds} second{}", if seconds == 1 { "" } else { "s" })
+            };
+            return format!(
+                "`caffeinate` asks macOS to keep the system from going to sleep. The `-t {seconds}` option sets a {seconds}-second limit ({duration}), then the request ends. This can use more battery while it runs; it does not change or delete files."
+            );
+        }
+    }
+    "`caffeinate` asks macOS to prevent sleep while its request is active. The options control which sleep behavior is affected and how long the request lasts. This can use more battery; it does not change or delete files.".into()
+}
+
 
 fn matched_evidence(title: &str, text: &str) -> String {
     let needles: &[&str] = match title {
@@ -668,6 +720,7 @@ fn matched_evidence(title: &str, text: &str) -> String {
         "Evaluates shell arithmetic" => &["$(("],
         "Converts random bytes into hexadecimal" => &["/dev/urandom", "od", "%02x", "tr -d", "$("],
         "Evaluates generated or transformed text" => &["eval", "invoke-expression", "iex", "$(", "`", "base64"],
+        "Keeps this Mac awake temporarily" => &["caffeinate"],
         _ => &[],
     };
     needles.iter().filter(|needle| text.contains(**needle)).map(|needle| format!("`{needle}`")).collect::<Vec<_>>().join("  ·  ")
