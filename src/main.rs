@@ -107,7 +107,7 @@ impl BashLens {
                 RichText::new(format!("{icon}    {title}"))
                     .size(13.0)
                     .color(if selected { INK } else { MUTED })
-                    .strong_if(selected),
+                    ,
             )
             .fill(if selected {
                 Color32::from_rgb(239, 239, 236)
@@ -619,8 +619,8 @@ fn analyze(text: &str) -> Analysis {
     if contains_any(&s, &["&&", "||", ";", "|", "\n"]) {
         add("Chains multiple steps", "More than one command may run in sequence or pass data between programs. Read each part before continuing.".into(), Level::Review);
     }
-    if actions.is_empty() {
-        add("No listed pattern found", "The local checks did not recognize one of their listed patterns. That is not evidence that the command is safe.".into(), Level::Unknown);
+    drop(add);    if actions.is_empty() {
+        actions.push(Action { title: "No listed pattern found", detail: "The local checks did not recognize one of their listed patterns. That is not evidence that the command is safe.".into(), level: Level::Unknown });
     }
     let shell = if s.contains("powershell") || s.contains("invoke-") || s.contains("winget") {
         "Likely PowerShell"
