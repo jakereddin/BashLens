@@ -727,7 +727,7 @@ fn caffeinate_explanation(text: &str) -> String {
                 format!("{seconds} second{}", if seconds == 1 { "" } else { "s" })
             };
             return format!(
-                "`caffeinate` asks macOS to keep the system from going to sleep. The `-t {seconds}` option sets a {seconds}-second limit ({duration}), then the request ends. This can use more battery while it runs; it does not change or delete files."
+                "`caffeinate` asks macOS to prevent idle sleep by default. The `-t {seconds}` option sets a {seconds}-second limit ({duration}), then the request ends. This can use more battery while it runs; it does not change or delete files."
             );
         }
     }
